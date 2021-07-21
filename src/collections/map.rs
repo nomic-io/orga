@@ -1,8 +1,11 @@
 use std::borrow::Borrow;
-use std::collections::{hash_map, HashMap};
+use std::cmp::Ordering;
+use std::collections::{btree_map, BTreeMap};
 use std::hash::Hash;
-use std::ops::{Deref, DerefMut};
+use std::iter::Peekable;
+use std::ops::{Bound, Deref, DerefMut, RangeBounds};
 
+use super::Next;
 use crate::state::*;
 use crate::store::*;
 use crate::Result;
@@ -19,7 +22,7 @@ use ed::*;
 /// changes to the backing store.
 pub struct Map<K, V, S = DefaultBackingStore> {
     store: Store<S>,
-    children: HashMap<K, Option<V>>,
+    children: BTreeMap<K, Option<V>>,
 }
 
 impl<K, V, S> From<Map<K, V, S>> for () {
@@ -28,7 +31,7 @@ impl<K, V, S> From<Map<K, V, S>> for () {
 
 impl<K, V, S> State<S> for Map<K, V, S>
 where
-    K: Encode + Terminated + Eq + Hash,
+    K: Encode + Terminated + Eq + Hash + Ord,
     V: State<S>,
 {
     type Encoding = ();
@@ -44,7 +47,7 @@ where
     where
         S: Write,
     {
-        for (key, maybe_value) in self.children.drain() {
+        for (key, maybe_value) in IntoIterator::into_iter(self.children) {
             Self::apply_change(&mut self.store, &key, maybe_value)?;
         }
 
@@ -54,7 +57,7 @@ where
 
 impl<K, V, S> Map<K, V, S>
 where
-    K: Encode + Terminated + Eq + Hash,
+    K: Encode + Terminated + Eq + Hash + Ord + Copy,
     V: State<S>,
     S: Read,
 {
@@ -112,7 +115,7 @@ where
         Ok(if self.children.contains_key(&key) {
             // value is already retained in memory (was modified)
             let entry = match self.children.entry(key) {
-                hash_map::Entry::Occupied(entry) => entry,
+                btree_map::Entry::Occupied(entry) => entry,
                 _ => unreachable!(),
             };
             let child = ChildMut::Modified(entry);
@@ -160,6 +163,114 @@ where
                 val.into()
             }))
         }
+    }
+}
+
+impl<'a, 'b, K, V, S> Map<K, V, S>
+where
+    K: Encode + Decode + Terminated + Eq + Hash + Next<K> + Ord + Copy,
+    V: State<S> + Decode + Copy,
+    S: Read,
+{
+    fn iter_merge_next(
+        map_iter: &mut Peekable<btree_map::Range<'a, K, Option<V>>>,
+        store_iter: &mut Peekable<Iter<Store<S>>>,
+    ) -> Result<Option<(K, Child<'a, V>)>> {
+        loop {
+            let has_map_entry = map_iter.peek().is_some();
+            let has_backing_entry = store_iter.peek().is_some();
+
+            return Ok(match (has_map_entry, has_backing_entry) {
+                // consumed both iterators, end here
+                (false, false) => None,
+
+                // consumed backing iterator, still have map values
+                (true, false) => {
+                    match map_iter.next().unwrap() {
+                        // map value has not been deleted, emit value
+                        (key, Some(value)) => Some((*key, Child::Unmodified(*value))),
+
+                        // map value is a delete, go to the next entry
+                        (_, None) => continue,
+                    }
+                }
+
+                // consumed map iterator, still have backing values
+                (false, true) => {
+                    match store_iter.next().transpose()? {
+                        Some(entry) => {
+                            let decoded_key: K = Decode::decode(entry.0.as_slice())?;
+                            let decoded_value: V = Decode::decode(entry.1.as_slice())?;
+
+                            Some((decoded_key, Child::Unmodified(decoded_value)))
+                        }
+
+                        // this should be unreachable considering the peek has returned that there
+                        // are values in the backing
+                        None => unreachable!("Peek ensures that this block is unreachable"),
+                    }
+                }
+
+                // merge values from both iterators
+                (true, true) => {
+                    let map_key = map_iter.peek().unwrap().0;
+                    let backing_key = match store_iter.peek().unwrap() {
+                        Err(err) => failure::bail!("{}", err),
+                        Ok((ref key, _)) => key,
+                    };
+
+                    let decoded_backing_key: K = Decode::decode(backing_key.as_slice())?;
+                    let key_cmp = map_key.cmp(&decoded_backing_key);
+
+                    // map_key > backing_key, emit the backing entry
+                    // map_key == backing_key, map entry shadows backing entry
+                    if key_cmp == Ordering::Greater || key_cmp == Ordering::Equal {
+                        let entry = store_iter.next().unwrap()?;
+                        let decoded_key: K = Decode::decode(entry.0.as_slice())?;
+                        let encoded_key: V = Decode::decode(entry.1.as_slice())?;
+
+                        return Ok(Some((decoded_key, Child::Unmodified(encoded_key))));
+                    }
+
+                    // map_key < backing_key
+                    match map_iter.next().unwrap() {
+                        (key, Some(value)) => Some((*key, Child::Modified(value))),
+
+                        // map entry deleted in in-memory map, skip
+                        (_, None) => continue,
+                    }
+                }
+            });
+        }
+    }
+
+    pub fn iter(&'a mut self) -> MapIterator<'a, K, V, S> {
+        self.range(..)
+    }
+
+    pub fn range<B: RangeBounds<K> + Clone>(&'a mut self, range: B) -> MapIterator<'a, K, V, S> {
+        let map_iter = self.children.range(range.clone()).peekable();
+        let bounds = (
+            encode_bound(range.start_bound()),
+            encode_bound(range.end_bound()),
+        );
+        let store_iter = self.store.range(bounds).peekable();
+
+        MapIterator {
+            map_iter,
+            store_iter,
+        }
+    }
+}
+
+fn encode_bound<K>(bound: Bound<&K>) -> Bound<Vec<u8>>
+where
+    K: Encode,
+{
+    match bound {
+        Bound::Included(inner) => Bound::Included(Encode::encode(inner).unwrap()),
+        Bound::Excluded(inner) => Bound::Excluded(Encode::encode(inner).unwrap()),
+        Bound::Unbounded => Bound::Unbounded,
     }
 }
 
@@ -216,6 +327,32 @@ where
         }
 
         Ok(())
+    }
+}
+
+pub struct MapIterator<'a, K, V, S>
+where
+    K: Next<K> + Decode + Encode + Terminated + Hash + Eq,
+    V: State<S>,
+    S: Read,
+{
+    map_iter: Peekable<btree_map::Range<'a, K, Option<V>>>,
+    store_iter: Peekable<Iter<'a, Store<S>>>,
+}
+
+impl<'a, K, V, S> Iterator for MapIterator<'a, K, V, S>
+where
+    K: Next<K> + Decode + Encode + Terminated + Hash + Eq + Ord + Copy,
+    V: State<S> + Copy + Decode,
+    S: Read,
+{
+    type Item = (K, Child<'a, V>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match Map::iter_merge_next(&mut self.map_iter, &mut self.store_iter) {
+            Err(err) => panic!("{}", err),
+            Ok(val) => val,
+        }
     }
 }
 
@@ -281,12 +418,12 @@ pub enum ChildMut<'a, K, V, S> {
 
     /// A mutable reference to an existing value which is being retained in
     /// memory because it was modified.
-    Modified(hash_map::OccupiedEntry<'a, K, Option<V>>),
+    Modified(btree_map::OccupiedEntry<'a, K, Option<V>>),
 }
 
 impl<'a, K, V, S> ChildMut<'a, K, V, S>
 where
-    K: Hash + Eq + Encode + Terminated,
+    K: Hash + Eq + Encode + Terminated + Ord + Copy,
     V: State<S>,
     S: Read,
 {
@@ -307,7 +444,7 @@ where
     }
 }
 
-impl<'a, K, V, S> Deref for ChildMut<'a, K, V, S> {
+impl<'a, K: Ord, V, S> Deref for ChildMut<'a, K, V, S> {
     type Target = V;
 
     fn deref(&self) -> &V {
@@ -320,7 +457,7 @@ impl<'a, K, V, S> Deref for ChildMut<'a, K, V, S> {
 
 impl<'a, K, V, S> DerefMut for ChildMut<'a, K, V, S>
 where
-    K: Eq + Hash,
+    K: Eq + Hash + Ord + Copy,
 {
     fn deref_mut(&mut self) -> &mut V {
         match self {
@@ -328,9 +465,17 @@ where
                 // insert into parent's children map and upgrade child to
                 // Child::ModifiedMut
                 let (key, value, parent) = inner.take().unwrap();
-                let entry = parent.children.entry(key).insert(Some(value));
-                *self = ChildMut::Modified(entry);
-                self.deref_mut()
+                let _insertion = parent.children.insert(key, Some(value));
+                let entry = parent.children.entry(key);
+                match entry {
+                    btree_map::Entry::Occupied(entry) => {
+                        *self = ChildMut::Modified(entry);
+                        self.deref_mut()
+                    }
+                    btree_map::Entry::Vacant(_entry) => {
+                        panic!("Map insertion ensures this block is unreachable")
+                    }
+                }
             }
             ChildMut::Modified(entry) => entry.get_mut().as_mut().unwrap(),
         }
@@ -339,7 +484,7 @@ where
 
 /// A mutable reference to a key/value entry in a collection, which may be
 /// empty.
-pub enum Entry<'a, K, V, S> {
+pub enum Entry<'a, K: Copy, V, S> {
     /// References an entry in the collection which does not have a value.
     Vacant {
         key: K,
@@ -352,7 +497,7 @@ pub enum Entry<'a, K, V, S> {
 
 impl<'a, K, V, S> Entry<'a, K, V, S>
 where
-    K: Encode + Terminated + Eq + Hash,
+    K: Encode + Terminated + Eq + Hash + Ord + Copy,
     V: State<S>,
     S: Read,
 {
@@ -393,7 +538,7 @@ where
 
 impl<'a, K, V, S> Entry<'a, K, V, S>
 where
-    K: Encode + Terminated + Eq + Hash,
+    K: Encode + Terminated + Eq + Hash + Ord + Copy,
     V: State<S>,
     S: Write,
 {
@@ -413,7 +558,7 @@ where
 
 impl<'a, K, V, S, D> Entry<'a, K, V, S>
 where
-    K: Encode + Terminated + Eq + Hash,
+    K: Encode + Terminated + Eq + Hash + Ord + Copy,
     V: State<S, Encoding = D>,
     S: Read,
     D: Default,
@@ -443,7 +588,7 @@ where
     }
 }
 
-impl<'a, K, V, S> From<Entry<'a, K, V, S>> for Option<ChildMut<'a, K, V, S>> {
+impl<'a, K: Copy, V, S> From<Entry<'a, K, V, S>> for Option<ChildMut<'a, K, V, S>> {
     fn from(entry: Entry<'a, K, V, S>) -> Self {
         match entry {
             Entry::Vacant { .. } => None,
@@ -454,8 +599,13 @@ impl<'a, K, V, S> From<Entry<'a, K, V, S>> for Option<ChildMut<'a, K, V, S>> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::deque::*;
     use super::*;
     use crate::store::{MapStore, Store};
+
+    fn enc(n: u32) -> Vec<u8> {
+        n.encode().unwrap()
+    }
 
     #[test]
     fn nonexistent() {
@@ -562,7 +712,650 @@ mod tests {
         assert!(store.get(&enc(16)).unwrap().is_none());
     }
 
-    fn enc(n: u32) -> Vec<u8> {
-        n.encode().unwrap()
+    #[test]
+    fn iter_merge_next_map_only() {
+        let store = Store::new(MapStore::new());
+        let mut map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        map.entry(12).unwrap().or_insert(24).unwrap();
+        map.entry(13).unwrap().or_insert(26).unwrap();
+        map.entry(14).unwrap().or_insert(28).unwrap();
+
+        let mut map_iter = map.children.range(..).peekable();
+        let mut range_iter = map.store.range(..).peekable();
+
+        let iter_next = Map::iter_merge_next(&mut map_iter, &mut range_iter).unwrap();
+        match iter_next {
+            Some((key, value)) => {
+                assert_eq!(key, 12);
+                assert_eq!(*value, 24);
+            }
+            None => assert!(false),
+        }
+
+        let iter_next = Map::iter_merge_next(&mut map_iter, &mut range_iter).unwrap();
+        match iter_next {
+            Some((key, value)) => {
+                assert_eq!(key, 13);
+                assert_eq!(*value, 26);
+            }
+            None => assert!(false),
+        }
+
+        let iter_next = Map::iter_merge_next(&mut map_iter, &mut range_iter).unwrap();
+        match iter_next {
+            Some((key, value)) => {
+                assert_eq!(key, 14);
+                assert_eq!(*value, 28);
+            }
+            None => assert!(false),
+        }
+
+        let iter_next = Map::iter_merge_next(&mut map_iter, &mut range_iter).unwrap();
+        match iter_next {
+            Some(_) => assert!(false),
+            None => (),
+        }
+    }
+
+    #[test]
+    fn iter_merge_next_store_only() {
+        let store = Store::new(MapStore::new());
+        let mut edit_map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        edit_map.entry(12).unwrap().or_insert(24).unwrap();
+        edit_map.entry(13).unwrap().or_insert(26).unwrap();
+        edit_map.entry(14).unwrap().or_insert(28).unwrap();
+
+        edit_map.flush().unwrap();
+
+        let read_map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        let mut map_iter = read_map.children.range(..).peekable();
+        let mut range_iter = read_map.store.range(..).peekable();
+
+        let iter_next = Map::iter_merge_next(&mut map_iter, &mut range_iter).unwrap();
+        match iter_next {
+            Some((key, value)) => {
+                assert_eq!(key, 12);
+                assert_eq!(*value, 24);
+            }
+            None => assert!(false),
+        }
+
+        let iter_next = Map::iter_merge_next(&mut map_iter, &mut range_iter).unwrap();
+        match iter_next {
+            Some((key, value)) => {
+                assert_eq!(key, 13);
+                assert_eq!(*value, 26);
+            }
+            None => assert!(false),
+        }
+
+        let iter_next = Map::iter_merge_next(&mut map_iter, &mut range_iter).unwrap();
+        match iter_next {
+            Some((key, value)) => {
+                assert_eq!(key, 14);
+                assert_eq!(*value, 28);
+            }
+            None => assert!(false),
+        }
+
+        let iter_next = Map::iter_merge_next(&mut map_iter, &mut range_iter).unwrap();
+        match iter_next {
+            Some(_) => assert!(false),
+            None => (),
+        }
+    }
+
+    #[test]
+    fn iter_merge_next_mem_remove() {
+        let store = Store::new(MapStore::new());
+        let mut edit_map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        edit_map.entry(12).unwrap().or_insert(24).unwrap();
+
+        edit_map.flush().unwrap();
+
+        let mut read_map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        read_map.remove(12).unwrap();
+
+        let mut map_iter = read_map.children.range(..).peekable();
+        let mut range_iter = read_map.store.range(..).peekable();
+
+        let iter_next = Map::iter_merge_next(&mut map_iter, &mut range_iter).unwrap();
+        match iter_next {
+            Some((key, value)) => {
+                assert_eq!(key, 12);
+                assert_eq!(*value, 24);
+            }
+            None => assert!(false),
+        }
+    }
+
+    #[test]
+    fn iter_merge_next_out_of_store_range() {
+        let store = Store::new(MapStore::new());
+        let mut edit_map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        edit_map.entry(12).unwrap().or_insert(24).unwrap();
+
+        edit_map.flush().unwrap();
+
+        let mut read_map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        read_map.entry(14).unwrap().or_insert(28).unwrap();
+
+        let mut map_iter = read_map.children.range(..).peekable();
+        let mut range_iter = read_map.store.range(..).peekable();
+
+        let iter_next = Map::iter_merge_next(&mut map_iter, &mut range_iter).unwrap();
+        match iter_next {
+            Some((key, value)) => {
+                assert_eq!(key, 12);
+                assert_eq!(*value, 24);
+            }
+            None => assert!(false),
+        }
+
+        let iter_next = Map::iter_merge_next(&mut map_iter, &mut range_iter).unwrap();
+        match iter_next {
+            Some((key, value)) => {
+                assert_eq!(key, 14);
+                assert_eq!(*value, 28);
+            }
+            None => {
+                assert!(false)
+            }
+        }
+    }
+
+    #[test]
+    fn iter_merge_next_store_key_in_map_range() {
+        let store = Store::new(MapStore::new());
+        let mut edit_map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        edit_map.entry(13).unwrap().or_insert(26).unwrap();
+
+        edit_map.flush().unwrap();
+
+        let mut read_map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        read_map.entry(12).unwrap().or_insert(24).unwrap();
+        read_map.entry(14).unwrap().or_insert(28).unwrap();
+
+        let mut map_iter = read_map.children.range(..).peekable();
+        let mut range_iter = read_map.store.range(..).peekable();
+
+        let iter_next = Map::iter_merge_next(&mut map_iter, &mut range_iter).unwrap();
+        match iter_next {
+            Some((key, value)) => {
+                assert_eq!(key, 12);
+                assert_eq!(*value, 24);
+            }
+            None => assert!(false),
+        }
+
+        let iter_next = Map::iter_merge_next(&mut map_iter, &mut range_iter).unwrap();
+        match iter_next {
+            Some((key, value)) => {
+                assert_eq!(key, 13);
+                assert_eq!(*value, 26);
+            }
+            None => {
+                assert!(false)
+            }
+        }
+    }
+
+    #[test]
+    fn iter_merge_next_map_key_none() {
+        let store = Store::new(MapStore::new());
+        let mut map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        map.entry(12).unwrap().or_insert(24).unwrap();
+        map.entry(13).unwrap().or_insert(26).unwrap();
+
+        map.remove(12).unwrap();
+
+        let mut map_iter = map.children.range(..).peekable();
+        let mut range_iter = map.store.range(..).peekable();
+
+        let iter_next = Map::iter_merge_next(&mut map_iter, &mut range_iter).unwrap();
+        match iter_next {
+            Some((key, value)) => {
+                assert_eq!(key, 13);
+                assert_eq!(*value, 26);
+            }
+            None => assert!(false),
+        }
+    }
+
+    #[test]
+    fn iter_merge_next_map_key_none_store_non_empty() {
+        let store = Store::new(MapStore::new());
+        let mut edit_map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        edit_map.entry(13).unwrap().or_insert(26).unwrap();
+
+        edit_map.flush().unwrap();
+
+        let mut read_map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        read_map.entry(12).unwrap().or_insert(24).unwrap();
+        read_map.remove(12).unwrap();
+
+        let mut map_iter = read_map.children.range(..).peekable();
+        let mut range_iter = read_map.store.range(..).peekable();
+
+        let iter_next = Map::iter_merge_next(&mut map_iter, &mut range_iter).unwrap();
+        match iter_next {
+            Some((key, value)) => {
+                assert_eq!(key, 13);
+                assert_eq!(*value, 26);
+            }
+            None => assert!(false),
+        }
+    }
+
+    #[test]
+    fn map_iter_map_only() {
+        let store = Store::new(MapStore::new());
+        let mut map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        map.entry(12).unwrap().or_insert(24).unwrap();
+        map.entry(13).unwrap().or_insert(26).unwrap();
+        map.entry(14).unwrap().or_insert(28).unwrap();
+
+        let mut actual: Vec<(u32, u32)> = Vec::with_capacity(3);
+
+        map.iter().for_each(|(k, v)| actual.push((k, *v)));
+
+        let expected: Vec<(u32, u32)> = vec![(12, 24), (13, 26), (14, 28)];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn map_iter_store_only() {
+        let store = Store::new(MapStore::new());
+        let mut edit_map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        edit_map.entry(12).unwrap().or_insert(24).unwrap();
+        edit_map.entry(13).unwrap().or_insert(26).unwrap();
+        edit_map.entry(14).unwrap().or_insert(28).unwrap();
+
+        edit_map.flush().unwrap();
+
+        let mut read_map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        let mut actual: Vec<(u32, u32)> = Vec::with_capacity(3);
+        read_map.iter().for_each(|(k, v)| actual.push((k, *v)));
+
+        let expected: Vec<(u32, u32)> = vec![(12, 24), (13, 26), (14, 28)];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn map_iter_mem_remove() {
+        let store = Store::new(MapStore::new());
+        let mut edit_map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        edit_map.entry(12).unwrap().or_insert(24).unwrap();
+
+        edit_map.flush().unwrap();
+
+        let mut read_map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        read_map.remove(12).unwrap();
+
+        let mut actual: Vec<(u32, u32)> = Vec::with_capacity(1);
+        read_map.iter().for_each(|(x, y)| actual.push((x, *y)));
+
+        let expected: Vec<(u32, u32)> = vec![(12, 24)];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn map_iter_out_of_store_range() {
+        let store = Store::new(MapStore::new());
+        let mut edit_map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        edit_map.entry(12).unwrap().or_insert(24).unwrap();
+
+        edit_map.flush().unwrap();
+
+        let mut read_map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        read_map.entry(14).unwrap().or_insert(28).unwrap();
+
+        let mut actual: Vec<(u32, u32)> = Vec::with_capacity(1);
+        read_map.iter().for_each(|(x, y)| actual.push((x, *y)));
+
+        let expected: Vec<(u32, u32)> = vec![(12, 24), (14, 28)];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn map_iter_store_key_in_map_range() {
+        let store = Store::new(MapStore::new());
+        let mut edit_map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        edit_map.entry(13).unwrap().or_insert(26).unwrap();
+
+        edit_map.flush().unwrap();
+
+        let mut read_map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        read_map.entry(12).unwrap().or_insert(24).unwrap();
+        read_map.entry(14).unwrap().or_insert(28).unwrap();
+
+        let mut actual: Vec<(u32, u32)> = Vec::with_capacity(1);
+        read_map.iter().for_each(|(x, y)| actual.push((x, *y)));
+
+        let expected: Vec<(u32, u32)> = vec![(12, 24), (13, 26), (14, 28)];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn map_iter_map_key_none() {
+        let store = Store::new(MapStore::new());
+        let mut map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        map.entry(12).unwrap().or_insert(24).unwrap();
+        map.entry(13).unwrap().or_insert(26).unwrap();
+
+        map.remove(12).unwrap();
+
+        let mut actual: Vec<(u32, u32)> = Vec::with_capacity(1);
+        map.iter().for_each(|(x, y)| actual.push((x, *y)));
+
+        let expected: Vec<(u32, u32)> = vec![(13, 26)];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn map_iter_map_key_none_store_non_empty() {
+        let store = Store::new(MapStore::new());
+        let mut edit_map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        edit_map.entry(13).unwrap().or_insert(26).unwrap();
+
+        edit_map.flush().unwrap();
+
+        let mut read_map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        read_map.entry(12).unwrap().or_insert(24).unwrap();
+        read_map.remove(12).unwrap();
+
+        let mut actual: Vec<(u32, u32)> = Vec::with_capacity(1);
+        read_map.iter().for_each(|(x, y)| actual.push((x, *y)));
+
+        let expected: Vec<(u32, u32)> = vec![(13, 26)];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn map_range_map_only_unbounded() {
+        let store = Store::new(MapStore::new());
+        let mut map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        map.entry(12).unwrap().or_insert(24).unwrap();
+        map.entry(13).unwrap().or_insert(26).unwrap();
+        map.entry(14).unwrap().or_insert(28).unwrap();
+
+        let mut actual: Vec<(u32, u32)> = Vec::with_capacity(3);
+
+        map.range(..).for_each(|(k, v)| actual.push((k, *v)));
+
+        let expected: Vec<(u32, u32)> = vec![(12, 24), (13, 26), (14, 28)];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn map_range_map_only_start_bounded() {
+        let store = Store::new(MapStore::new());
+        let mut map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        map.entry(12).unwrap().or_insert(24).unwrap();
+        map.entry(13).unwrap().or_insert(26).unwrap();
+        map.entry(14).unwrap().or_insert(28).unwrap();
+
+        let mut actual: Vec<(u32, u32)> = Vec::with_capacity(3);
+
+        map.range(13..).for_each(|(k, v)| actual.push((k, *v)));
+
+        let expected: Vec<(u32, u32)> = vec![(13, 26), (14, 28)];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn map_range_map_only_end_bounded_non_inclusive() {
+        let store = Store::new(MapStore::new());
+        let mut map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        map.entry(12).unwrap().or_insert(24).unwrap();
+        map.entry(13).unwrap().or_insert(26).unwrap();
+        map.entry(14).unwrap().or_insert(28).unwrap();
+
+        let mut actual: Vec<(u32, u32)> = Vec::with_capacity(3);
+
+        map.range(..13).for_each(|(k, v)| actual.push((k, *v)));
+
+        let expected: Vec<(u32, u32)> = vec![(12, 24)];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn map_range_map_only_end_bounded_inclusive() {
+        let store = Store::new(MapStore::new());
+        let mut map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        map.entry(12).unwrap().or_insert(24).unwrap();
+        map.entry(13).unwrap().or_insert(26).unwrap();
+        map.entry(14).unwrap().or_insert(28).unwrap();
+
+        let mut actual: Vec<(u32, u32)> = Vec::with_capacity(3);
+
+        map.range(..=13).for_each(|(k, v)| actual.push((k, *v)));
+
+        let expected: Vec<(u32, u32)> = vec![(12, 24), (13, 26)];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn map_range_map_only_bounded_non_inclusive() {
+        let store = Store::new(MapStore::new());
+        let mut map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        map.entry(12).unwrap().or_insert(24).unwrap();
+        map.entry(13).unwrap().or_insert(26).unwrap();
+        map.entry(14).unwrap().or_insert(28).unwrap();
+
+        let mut actual: Vec<(u32, u32)> = Vec::with_capacity(3);
+
+        map.range(12..14).for_each(|(k, v)| actual.push((k, *v)));
+
+        let expected: Vec<(u32, u32)> = vec![(12, 24), (13, 26)];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn map_range_map_only_bounded_inclusive() {
+        let store = Store::new(MapStore::new());
+        let mut map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        map.entry(12).unwrap().or_insert(24).unwrap();
+        map.entry(13).unwrap().or_insert(26).unwrap();
+        map.entry(14).unwrap().or_insert(28).unwrap();
+
+        let mut actual: Vec<(u32, u32)> = Vec::with_capacity(3);
+
+        map.range(12..=14).for_each(|(k, v)| actual.push((k, *v)));
+
+        let expected: Vec<(u32, u32)> = vec![(12, 24), (13, 26), (14, 28)];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn map_range_store_only_bounded_non_inclusive() {
+        let store = Store::new(MapStore::new());
+        let mut edit_map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        edit_map.entry(12).unwrap().or_insert(24).unwrap();
+        edit_map.entry(13).unwrap().or_insert(26).unwrap();
+        edit_map.entry(14).unwrap().or_insert(28).unwrap();
+
+        edit_map.flush().unwrap();
+
+        let mut read_map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        let mut actual: Vec<(u32, u32)> = Vec::with_capacity(3);
+
+        read_map
+            .range(12..14)
+            .for_each(|(k, v)| actual.push((k, *v)));
+
+        let expected: Vec<(u32, u32)> = vec![(12, 24), (13, 26)];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn map_range_store_only_bounded_inclusive() {
+        let store = Store::new(MapStore::new());
+        let mut edit_map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        edit_map.entry(12).unwrap().or_insert(24).unwrap();
+        edit_map.entry(13).unwrap().or_insert(26).unwrap();
+        edit_map.entry(14).unwrap().or_insert(28).unwrap();
+
+        edit_map.flush().unwrap();
+
+        let mut read_map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        let mut actual: Vec<(u32, u32)> = Vec::with_capacity(3);
+
+        read_map
+            .range(12..=14)
+            .for_each(|(k, v)| actual.push((k, *v)));
+
+        let expected: Vec<(u32, u32)> = vec![(12, 24), (13, 26), (14, 28)];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn map_range_bounded() {
+        let store = Store::new(MapStore::new());
+        let mut edit_map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        edit_map.entry(12).unwrap().or_insert(24).unwrap();
+        edit_map.entry(14).unwrap().or_insert(28).unwrap();
+
+        edit_map.flush().unwrap();
+
+        let mut read_map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+        read_map.entry(13).unwrap().or_insert(26).unwrap();
+
+        let mut actual: Vec<(u32, u32)> = Vec::with_capacity(3);
+
+        read_map
+            .range(12..=14)
+            .for_each(|(k, v)| actual.push((k, *v)));
+
+        let expected: Vec<(u32, u32)> = vec![(12, 24), (13, 26), (14, 28)];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn map_range_empty() {
+        let store = Store::new(MapStore::new());
+        let mut map: Map<u32, u32> = Map::create(store.clone(), ()).unwrap();
+
+        let mut actual: Vec<(u32, u32)> = Vec::with_capacity(3);
+
+        map.range(..).for_each(|(k, v)| actual.push((k, *v)));
+
+        let expected: Vec<(u32, u32)> = vec![];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn map_of_map() {
+        let store = Store::new(MapStore::new());
+        let mut map: Map<u32, Map<u32, u32>> = Map::create(store.clone(), ()).unwrap();
+
+        map.entry(42).unwrap().or_insert(()).unwrap();
+
+        let mut sub_map = map.get_mut(42).unwrap().unwrap();
+        sub_map.entry(13).unwrap().or_insert(26).unwrap();
+
+        let inner_map = map.get(42).unwrap().unwrap();
+        let actual = inner_map.get(13).unwrap().unwrap();
+
+        assert_eq!(*actual, 26);
+    }
+
+    #[test]
+    fn map_of_map_from_store() {
+        let store = Store::new(MapStore::new());
+        let mut edit_map: Map<u32, Map<u32, u32>> = Map::create(store.clone(), ()).unwrap();
+
+        edit_map.entry(42).unwrap().or_insert(()).unwrap();
+
+        let mut sub_map = edit_map.get_mut(42).unwrap().unwrap();
+        sub_map.entry(13).unwrap().or_insert(26).unwrap();
+
+        edit_map.flush().unwrap();
+
+        let read_map: Map<u32, Map<u32, u32>> = Map::create(store.clone(), ()).unwrap();
+        let inner_map = read_map.get(42).unwrap().unwrap();
+        let actual = inner_map.get(13).unwrap().unwrap();
+
+        assert_eq!(*actual, 26);
+    }
+
+    #[test]
+    fn map_of_deque() {
+        let store = Store::new(MapStore::new());
+        let mut edit_map: Map<u32, Deque<u32>> = Map::create(store.clone(), ()).unwrap();
+
+        edit_map
+            .entry(42)
+            .unwrap()
+            .or_insert(Meta::default())
+            .unwrap();
+
+        let mut deque = edit_map.get_mut(42).unwrap().unwrap();
+        deque.push_front(84).unwrap();
+
+        edit_map.flush().unwrap();
+
+        let mut read_map: Map<u32, Deque<u32>> = Map::create(store.clone(), ()).unwrap();
+        let actual = read_map
+            .get_mut(42)
+            .unwrap()
+            .unwrap()
+            .pop_front()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(*actual, 84);
     }
 }
